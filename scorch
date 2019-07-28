@@ -31,6 +31,8 @@ import stat
 import sys
 import tempfile
 import time
+from collections import namedtuple
+from datetime import datetime
 from itertools import takewhile
 
 
@@ -126,6 +128,9 @@ to help in discovering file corruption, missing files, duplicates, etc.
 positional arguments:
   instruction:             * add: compute and store hashes for all found files
                            * append: compute and store for newly found files
+                           * backup: backs up selected database
+                           * restore: restore backed up database
+                           * list-backups: list database backups
                            * check+update: check and update if new
                            * check: check stored hashes against files
                            * cleanup: remove hashes of missing files
@@ -180,7 +185,9 @@ def build_arg_parser():
                         type=str,
                         default=DEFAULT_DB)
     parser.add_argument('inst',
-                        choices=['add','append','check',
+                        choices=['add','append',
+                                 'backup','restore',
+                                 'list-backups','check',
                                  'check+update','delete',
                                  'cleanup','list',
                                  'list-unhashed','list-dups',
@@ -884,6 +891,51 @@ def notfound_in_db(opts,path,db,dbadd,dbremove):
     return rv
 
 
+def backup_db(opts,path,db,dbadd,dbremove):
+    timestamp  = datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    filename   = os.path.basename(opts.dbpath)
+    filename   = '{}.backup_{}'.format(filename,timestamp)
+    tgt_dbpath = os.path.join(path,filename)
+
+    try:
+        write_db_core(tgt_dbpath,db)
+        if opts.verbose:
+            print(tgt_dbpath)
+        return SUCCESS
+    except Exception as e:
+        print('Error backing up {} - {}'.format(tgt_dbpath,e))
+        return ERROR_PROCESSING
+
+
+def restore_db(opts,path,db,dbadd,dbremove):
+    try:
+        old_db = read_db(path)
+        dbadd.update(old_db)
+        return SUCCESS
+    except Exception as e:
+        dbadd    = {}
+        dbremove = []
+        print('Error restoring {} - {}'.format(path,e))
+        return ERROR_PROCESSING
+
+
+def list_backups(opts,path,db,dbadd,dbremove):
+    try:
+        filename = os.path.basename(opts.dbpath)
+        prefix   = '{}.backup_'.format(filename)
+        for entry in os.listdir(path):
+            fullpath = os.path.join(path,entry)
+            if not entry.startswith(prefix):
+                continue
+            if not os.path.isfile(fullpath):
+                continue
+            print(fullpath)
+        return SUCCESS
+    except Exception as e:
+        print('Error listing backups for {} - {}'.format(opts.dbpath,e))
+        return ERROR_PROCESSING
+
+
 def is_not_sticky(fi):
     return not bool(fi.mode & stat.S_ISVTX)
 
@@ -907,36 +959,27 @@ def fnfilter_fun(regex):
     return (lambda filepath: False)
 
 
-def inst_fun(inst):
-    if inst == 'add':
-        return add_hashes
-    elif inst == 'append':
-        return append_hashes
-    elif inst == 'check':
-        return check_hashes
-    elif inst == 'check+update':
-        return check_and_update_hashes
-    elif inst == 'delete':
-        return delete_hashes
-    elif inst == 'cleanup':
-        return cleanup_hashes
-    elif inst == 'list':
-        return list_hashes
-    elif inst == 'list-unhashed':
-        return list_unhashed
-    elif inst == 'list-dups':
-        return list_dups
-    elif inst == 'list-solo':
-        return list_solo
-    elif inst == 'list-missing':
-        return list_missing
-    elif inst == 'in-db':
-        return in_db
-    elif inst == 'found-in-db':
-        return found_in_db
-    elif inst == 'notfound-in-db':
-        return notfound_in_db
-    return None
+Instruction = namedtuple('Instruction',['fun','needs_dirs','load_db'])
+
+INSTRUCTIONS = {
+    'add': Instruction(add_hashes,True,True),
+    'append': Instruction(append_hashes,True,True),
+    'backup': Instruction(backup_db,False,True),
+    'restore': Instruction(restore_db,True,False),
+    'list-backups': Instruction(list_backups,False,False),
+    'check': Instruction(check_hashes,True,True),
+    'check+update': Instruction(check_and_update_hashes,True,True),
+    'delete': Instruction(delete_hashes,True,True),
+    'cleanup': Instruction(cleanup_hashes,True,True),
+    'list': Instruction(list_hashes,True,True),
+    'list-unhashed': Instruction(list_unhashed,True,True),
+    'list-dups': Instruction(list_dups,True,True),
+    'list-solo': Instruction(list_solo,True,True),
+    'list-missing': Instruction(list_missing,True,True),
+    'in-db': Instruction(in_db,True,True),
+    'found-in-db': Instruction(found_in_db,True,True),
+    'notfound-in-db': Instruction(notfound_in_db,True,True)
+}
 
 
 def sort_fun(sort):
@@ -1005,16 +1048,16 @@ def write_db_core(filepath,db):
     os.replace(tmpfilepath,filepath)
 
 
-def write_db(filepath,dbadd,dbremove):
+def write_db(src_filepath,tgt_filepath,dbadd,dbremove):
     try:
-        db = read_db(filepath)
+        db = read_db(src_filepath)
 
-        for (k,v) in dbadd.items():
-            db[k] = v;
         for k in dbremove:
             del db[k]
+        for (k,v) in dbadd.items():
+            db[k] = v;
 
-        write_db_core(filepath,db)
+        write_db_core(tgt_filepath,db)
     except (KeyboardInterrupt,SystemExit):
         raise
     except Exception as e:
@@ -1058,7 +1101,7 @@ def main():
     if args.help:
         print_help()
         parser.exit(status=SUCCESS)
-    if not args.dir:
+    if not args.inst:
         print_help()
         parser.exit(status=ERROR_ARG)
 
@@ -1069,19 +1112,29 @@ def main():
     opts.maxactions   = args.maxactions
     opts.maxdata      = human_to_bytes(args.maxdata)
     opts.breakonerror = args.break_on_error
+    opts.dbpath       = process_dbpath(args.db)
 
-    dbpath       = process_dbpath(args.db)
-    func         = inst_fun(args.inst)
+    if not args.dir:
+        if INSTRUCTIONS[args.inst].needs_dirs:
+            print_help()
+            parser.exit(status=ERROR_ARG)
+        else:
+            args.dir = [os.path.dirname(opts.dbpath)]
+
+    func         = INSTRUCTIONS[args.inst].fun
     fnfilter     = fnfilter_fun(args.fnfilter)
     fifilter     = restrict_fun(args.restrict)
     directories  = process_directories(args.dir)
+    load_db      = INSTRUCTIONS[args.inst].load_db
 
     rv = SUCCESS
     try:
         for directory in directories:
-            db       = read_db(dbpath)
+            db       = {}
             dbadd    = {}
             dbremove = []
+            if load_db:
+                db = read_db(opts.dbpath)
 
             opts.filter = FileFilter(basepath=directory,
                                      fnfilter=fnfilter,
@@ -1093,7 +1146,7 @@ def main():
                 pass
 
             if len(dbadd) or len(dbremove):
-                write_db(dbpath,dbadd,dbremove)
+                write_db(opts.dbpath,opts.dbpath,dbadd,dbremove)
 
             if opts.breakonerror and rv:
                 break
